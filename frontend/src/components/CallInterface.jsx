@@ -13,7 +13,7 @@ import {
   Loader2,
 } from 'lucide-react'
 import { startCall, createCallWebSocket } from '../services/api'
-import { AudioHandler, float32ToBase64, playAudioBase64 } from '../services/webrtc'
+import { AudioHandler, float32ToArrayBuffer, playAudioBase64 } from '../services/webrtc'
 
 const URGENCY_COLORS = {
   LOW: 'text-green-600 bg-green-50',
@@ -169,15 +169,14 @@ export default function CallInterface({ backendReady }) {
       const handler = new AudioHandler({
         onAudioChunk: (chunk) => {
           if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            const b64 = float32ToBase64(chunk)
-            wsRef.current.send(
-              JSON.stringify({ type: 'audio', data: b64, sample_rate: 16000 })
-            )
+            // Send raw Float32 bytes as a binary WebSocket frame (no Base64 overhead)
+            const buffer = float32ToArrayBuffer(chunk)
+            wsRef.current.send(buffer)
             setIsProcessing(true)
           }
         },
         sampleRate: 16000,
-        chunkDurationMs: 3000,
+        chunkDurationMs: 500,
       })
 
       const started = await handler.start()

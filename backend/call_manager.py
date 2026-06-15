@@ -228,6 +228,7 @@ class CallManager:
         appointment_data = await self.ai_engine.extract_appointment_details(
             active_call.conversation_history
         )
+        logger.info(f"📅 Appointment extraction result for {call_id}: {appointment_data}")
 
         # Generate call summary
         summary = await self.ai_engine.summarize_call(
@@ -254,25 +255,65 @@ class CallManager:
                 )
 
             # Save appointment if extracted
-            if appointment_data and appointment_data.get("preferred_date"):
-                try:
-                    appt_date = date.fromisoformat(appointment_data["preferred_date"])
-                    appt_time_str = appointment_data.get("preferred_time", "09:00")
-                    appt_time = time.fromisoformat(appt_time_str)
+            if appointment_data:
+                # Support multiple key names the LLM might use
+                appt_date_str = (
+                    appointment_data.get("preferred_date")
+                    or appointment_data.get("date")
+                    or appointment_data.get("appointment_date")
+                )
+                appt_time_str = (
+                    appointment_data.get("preferred_time")
+                    or appointment_data.get("time")
+                    or appointment_data.get("appointment_time")
+                    or "09:00"
+                )
 
-                    appointment = Appointment(
-                        call_id=call_id,
-                        customer_name=appointment_data.get("customer_name", "Unknown"),
-                        customer_phone=appointment_data.get("customer_phone"),
-                        customer_email=appointment_data.get("customer_email"),
-                        service_requested=appointment_data.get("service_requested"),
-                        appointment_date=appt_date,
-                        appointment_time=appt_time,
-                        notes=appointment_data.get("notes"),
-                    )
-                    db.add(appointment)
-                except (ValueError, TypeError) as e:
-                    logger.error(f"Invalid appointment data: {e}")
+                if appt_date_str and appt_date_str.lower() not in ("null", "none", "n/a", ""):
+                    try:
+                        appt_date = date.fromisoformat(appt_date_str)
+                        # Handle various time formats
+                        clean_time = appt_time_str.strip().replace(" ", "")
+                        if clean_time.lower() in ("null", "none", "n/a", ""):
+                            clean_time = "09:00"
+                        # Strip seconds if present (e.g. "09:00:00")
+                        time_parts = clean_time.split(":")
+                        appt_time = time(int(time_parts[0]), int(time_parts[1]))
+
+                        appointment = Appointment(
+                            call_id=call_id,
+                            customer_name=(
+                                appointment_data.get("customer_name")
+                                or appointment_data.get("name")
+                                or "Unknown"
+                            ),
+                            customer_phone=(
+                                appointment_data.get("customer_phone")
+                                or appointment_data.get("phone")
+                            ),
+                            customer_email=(
+                                appointment_data.get("customer_email")
+                                or appointment_data.get("email")
+                            ),
+                            service_requested=(
+                                appointment_data.get("service_requested")
+                                or appointment_data.get("service")
+                            ),
+                            appointment_date=appt_date,
+                            appointment_time=appt_time,
+                            notes=appointment_data.get("notes"),
+                        )
+                        db.add(appointment)
+                        logger.info(
+                            f"✅ Appointment saved for {call_id}: "
+                            f"{appointment.customer_name} on {appt_date} at {appt_time}"
+                        )
+                    except (ValueError, TypeError, IndexError) as e:
+                        logger.error(f"Invalid appointment data for {call_id}: {e} — raw: {appointment_data}")
+                else:
+                    logger.info(f"ℹ️ No appointment date found in extraction for {call_id}")
+            else:
+                logger.info(f"ℹ️ No appointment data extracted for {call_id}")
 
             db.commit()
         except Exception as e:

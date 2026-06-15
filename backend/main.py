@@ -433,9 +433,10 @@ async def update_business_config(payload: dict):
 async def websocket_call(websocket: WebSocket, call_id: str):
     """
     WebSocket endpoint for real-time voice calls.
-    
+
     Protocol:
-    - Client sends: {"type": "audio", "data": "<base64-encoded-audio>", "sample_rate": 16000}
+    - Client sends: binary frame (raw Float32 audio bytes, 16 kHz mono)  ← preferred
+    - Client sends: {"type": "audio", "data": "<base64-audio>", "sample_rate": 16000}  ← legacy
     - Client sends: {"type": "text", "data": "text message"}
     - Client sends: {"type": "end_call"}
     - Server responds: {"type": "response", "text": "...", "audio": "<base64>", "urgency": {...}}
@@ -457,20 +458,16 @@ async def websocket_call(websocket: WebSocket, call_id: str):
 
     try:
         while True:
-            raw = await websocket.receive_text()
-            message = json.loads(raw)
-            msg_type = message.get("type")
+            # Accept both binary frames (raw audio) and text frames (JSON commands)
+            ws_message = await websocket.receive()
 
-            if msg_type == "audio":
-                # Decode base64 audio
-                audio_bytes = base64.b64decode(message["data"])
-                sample_rate = message.get("sample_rate", 16000)
-
+            if "bytes" in ws_message and ws_message["bytes"]:
+                # Binary frame: raw Float32 audio bytes from AudioWorklet
+                audio_bytes = ws_message["bytes"]
                 result = await call_manager.process_caller_audio(
-                    call_id, audio_bytes, sample_rate
+                    call_id, audio_bytes, 16000
                 )
 
-                # Send transcript of what caller said
                 if result.get("caller_text"):
                     await websocket.send_json({
                         "type": "transcript",
@@ -478,7 +475,6 @@ async def websocket_call(websocket: WebSocket, call_id: str):
                         "text": result["caller_text"],
                     })
 
-                # Send agent response
                 if result.get("response_text"):
                     response_msg = {
                         "type": "response",
@@ -491,11 +487,27 @@ async def websocket_call(websocket: WebSocket, call_id: str):
                         ).decode("utf-8")
                     await websocket.send_json(response_msg)
 
-            elif msg_type == "text":
-                # Text-based message (for testing without voice)
-                text = message.get("data", "").strip()
-                if text:
-                    result = await call_manager.process_caller_text(call_id, text)
+            elif "text" in ws_message and ws_message["text"]:
+                # Text frame: JSON command (text message, end_call, or legacy base64 audio)
+                raw = ws_message["text"]
+                message = json.loads(raw)
+                msg_type = message.get("type")
+
+                if msg_type == "audio":
+                    # Legacy base64 audio (backward compatibility)
+                    audio_bytes = base64.b64decode(message["data"])
+                    sample_rate = message.get("sample_rate", 16000)
+
+                    result = await call_manager.process_caller_audio(
+                        call_id, audio_bytes, sample_rate
+                    )
+
+                    if result.get("caller_text"):
+                        await websocket.send_json({
+                            "type": "transcript",
+                            "role": "caller",
+                            "text": result["caller_text"],
+                        })
 
                     if result.get("response_text"):
                         response_msg = {
@@ -509,16 +521,33 @@ async def websocket_call(websocket: WebSocket, call_id: str):
                             ).decode("utf-8")
                         await websocket.send_json(response_msg)
 
-            elif msg_type == "end_call":
-                result = await call_manager.end_call(call_id)
-                await websocket.send_json({
-                    "type": "call_ended",
-                    "summary": result.get("summary"),
-                    "urgency": result.get("urgency"),
-                    "appointment": result.get("appointment"),
-                    "duration_seconds": result.get("duration_seconds"),
-                })
-                break
+                elif msg_type == "text":
+                    text = message.get("data", "").strip()
+                    if text:
+                        result = await call_manager.process_caller_text(call_id, text)
+
+                        if result.get("response_text"):
+                            response_msg = {
+                                "type": "response",
+                                "text": result["response_text"],
+                                "urgency": result.get("urgency"),
+                            }
+                            if result.get("response_audio"):
+                                response_msg["audio"] = base64.b64encode(
+                                    result["response_audio"]
+                                ).decode("utf-8")
+                            await websocket.send_json(response_msg)
+
+                elif msg_type == "end_call":
+                    result = await call_manager.end_call(call_id)
+                    await websocket.send_json({
+                        "type": "call_ended",
+                        "summary": result.get("summary"),
+                        "urgency": result.get("urgency"),
+                        "appointment": result.get("appointment"),
+                        "duration_seconds": result.get("duration_seconds"),
+                    })
+                    break
 
     except WebSocketDisconnect:
         logger.info(f"🔌 WebSocket disconnected: {call_id}")

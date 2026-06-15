@@ -10,6 +10,8 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+import asyncio
+
 import yaml
 import ollama
 
@@ -17,14 +19,16 @@ logger = logging.getLogger(__name__)
 
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config")
 MODEL_NAME = "llama3.1:8b"
+MAX_CONTEXT_MESSAGES = 15
 
 
 class AIEngine:
     def __init__(self):
         self.business_info = self._load_business_info()
         self.prompts = self._load_prompts()
-        self.client = ollama.Client()
-        self._verify_model()
+        self.client = ollama.AsyncClient()
+        # Verify model synchronously at startup (before event loop is running)
+        self._verify_model_sync()
 
     def _load_business_info(self) -> dict:
         """Load business configuration from YAML."""
@@ -38,10 +42,11 @@ class AIEngine:
         with open(path, "r") as f:
             return yaml.safe_load(f)
 
-    def _verify_model(self):
-        """Check that the Ollama model is available."""
+    def _verify_model_sync(self):
+        """Check that the Ollama model is available (sync, for startup)."""
         try:
-            models = self.client.list()
+            sync_client = ollama.Client()
+            models = sync_client.list()
             model_names = [m.model for m in models.models]
             if not any(MODEL_NAME in name for name in model_names):
                 logger.warning(
@@ -121,14 +126,16 @@ class AIEngine:
 
         ollama_messages = [{"role": "system", "content": system_prompt}]
 
-        for msg in conversation_history:
+        # Cap history to avoid exceeding LLM context window on long calls
+        recent_history = conversation_history[-MAX_CONTEXT_MESSAGES:]
+        for msg in recent_history:
             role = "user" if msg["role"] == "caller" else "assistant"
             ollama_messages.append({"role": role, "content": msg["content"]})
 
         ollama_messages.append({"role": "user", "content": caller_message})
 
         try:
-            response = self.client.chat(
+            response = await self.client.chat(
                 model=MODEL_NAME,
                 messages=ollama_messages,
                 options={
@@ -146,13 +153,16 @@ class AIEngine:
         self, conversation_history: list[dict]
     ) -> Optional[dict]:
         """Extract appointment details from conversation using LLM."""
+        from datetime import date as date_type
+
         template = self.prompts.get("appointment_extraction", "")
         prompt = template.format(
-            conversation_history=self._format_conversation_history(conversation_history)
+            conversation_history=self._format_conversation_history(conversation_history),
+            today_date=date_type.today().isoformat(),
         )
 
         try:
-            response = self.client.chat(
+            response = await self.client.chat(
                 model=MODEL_NAME,
                 messages=[
                     {
@@ -161,15 +171,24 @@ class AIEngine:
                     },
                     {"role": "user", "content": prompt},
                 ],
-                options={"temperature": 0.1, "num_predict": 300},
+                options={"temperature": 0.1, "num_predict": 500},
             )
             text = response["message"]["content"].strip()
+            logger.info(f"Raw appointment extraction LLM response: {text[:500]}")
             # Try to parse JSON from the response
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
             elif "```" in text:
                 text = text.split("```")[1].split("```")[0].strip()
-            return json.loads(text)
+
+            result = json.loads(text)
+
+            # Skip if LLM explicitly says no appointment was requested
+            if result.get("appointment_requested") is False:
+                logger.info("LLM determined no appointment was requested")
+                return None
+
+            return result
         except (json.JSONDecodeError, Exception) as e:
             logger.error(f"Appointment extraction error: {e}")
             return None
@@ -189,7 +208,7 @@ class AIEngine:
         }
 
         try:
-            response = self.client.chat(
+            response = await self.client.chat(
                 model=MODEL_NAME,
                 messages=[
                     {
@@ -236,7 +255,7 @@ class AIEngine:
         }
 
         try:
-            response = self.client.chat(
+            response = await self.client.chat(
                 model=MODEL_NAME,
                 messages=[
                     {

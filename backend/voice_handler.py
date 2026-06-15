@@ -4,6 +4,7 @@ Voice Handler - Manages Speech-to-Text and Text-to-Speech using open-source mode
   TTS: Piper TTS (CPU, fast neural synthesis)
 """
 
+import asyncio
 import io
 import os
 import wave
@@ -66,8 +67,24 @@ class SpeechToText:
             except Exception as e2:
                 logger.error(f"Failed to load Faster-Whisper on CPU: {e2}")
 
+    def _transcribe_sync(self, audio_array: np.ndarray) -> str:
+        """Synchronous transcription (runs in thread pool)."""
+        segments, info = self.model.transcribe(
+            audio_array,
+            beam_size=5,
+            language="en",
+            vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=500,
+                speech_pad_ms=200,
+            ),
+        )
+        text = " ".join(segment.text for segment in segments).strip()
+        logger.debug(f"STT result: '{text}' (lang={info.language}, prob={info.language_probability:.2f})")
+        return text
+
     async def transcribe(self, audio_data: bytes, sample_rate: int = 16000) -> str:
-        """Transcribe audio bytes to text."""
+        """Transcribe audio bytes to text (non-blocking)."""
         if self.model is None:
             logger.error("STT model not loaded")
             return ""
@@ -87,20 +104,8 @@ class SpeechToText:
                 num_samples = int(len(audio_array) * 16000 / sample_rate)
                 audio_array = resample(audio_array, num_samples)
 
-            segments, info = self.model.transcribe(
-                audio_array,
-                beam_size=5,
-                language="en",
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=500,
-                    speech_pad_ms=200,
-                ),
-            )
-
-            text = " ".join(segment.text for segment in segments).strip()
-            logger.debug(f"STT result: '{text}' (lang={info.language}, prob={info.language_probability:.2f})")
-            return text
+            # Run transcription in a thread to avoid blocking the event loop
+            return await asyncio.to_thread(self._transcribe_sync, audio_array)
 
         except Exception as e:
             logger.error(f"Transcription error: {e}")
@@ -132,7 +137,22 @@ class TextToSpeech:
         self.voice_model_path = os.path.join(PIPER_VOICE_DIR, f"{voice}.onnx")
         self.voice_config_path = os.path.join(PIPER_VOICE_DIR, f"{voice}.onnx.json")
         self._piper_available = False
+        self._piper_voice = None  # Cached PiperVoice instance
         self._check_piper()
+        self._load_voice_model()
+
+    def _load_voice_model(self):
+        """Pre-load the PiperVoice model so it's not re-loaded on every call."""
+        if not os.path.exists(self.voice_model_path):
+            return
+        try:
+            from piper import PiperVoice
+            self._piper_voice = PiperVoice.load(
+                self.voice_model_path, self.voice_config_path
+            )
+            logger.info(f"✅ Piper voice model cached: {self.voice_name}")
+        except Exception as e:
+            logger.warning(f"Could not pre-load Piper voice model: {e}")
 
     def _check_piper(self):
         """Check if Piper TTS is available."""
@@ -178,55 +198,63 @@ class TextToSpeech:
                 logger.error(f"CLI Piper synthesis also failed: {e2}")
                 return None
 
-    async def _synthesize_with_python(self, text: str) -> Optional[bytes]:
-        """Synthesize using piper Python module."""
-        try:
+    def _synthesize_sync(self, text: str) -> Optional[bytes]:
+        """Synchronous synthesis (runs in thread pool)."""
+        if self._piper_voice is None:
             from piper import PiperVoice
+            self._piper_voice = PiperVoice.load(
+                self.voice_model_path, self.voice_config_path
+            )
 
-            voice = PiperVoice.load(self.voice_model_path, self.voice_config_path)
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            self._piper_voice.synthesize(text, wav_file)
 
-            buffer = io.BytesIO()
-            with wave.open(buffer, "wb") as wav_file:
-                voice.synthesize(text, wav_file)
+        audio_bytes = buffer.getvalue()
+        logger.debug(f"TTS synthesized {len(audio_bytes)} bytes for: '{text[:50]}...'")
+        return audio_bytes
 
-            audio_bytes = buffer.getvalue()
-            logger.debug(f"TTS synthesized {len(audio_bytes)} bytes for: '{text[:50]}...'")
-            return audio_bytes
-
+    async def _synthesize_with_python(self, text: str) -> Optional[bytes]:
+        """Synthesize using piper Python module (non-blocking)."""
+        try:
+            return await asyncio.to_thread(self._synthesize_sync, text)
         except ImportError:
             raise
         except Exception as e:
             logger.error(f"Piper Python synthesis error: {e}")
             raise
 
+    def _synthesize_cli_sync(self, text: str) -> Optional[bytes]:
+        """Synchronous CLI synthesis (runs in thread pool)."""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=AUDIO_TEMP_DIR) as tmp:
+            tmp_path = tmp.name
+
+        process = subprocess.run(
+            [
+                "piper",
+                "--model", self.voice_model_path,
+                "--output_file", tmp_path,
+            ],
+            input=text,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if process.returncode != 0:
+            logger.error(f"Piper CLI error: {process.stderr}")
+            return None
+
+        with open(tmp_path, "rb") as f:
+            audio_bytes = f.read()
+
+        os.unlink(tmp_path)
+        return audio_bytes
+
     async def _synthesize_with_cli(self, text: str) -> Optional[bytes]:
-        """Synthesize using Piper CLI as fallback."""
+        """Synthesize using Piper CLI as fallback (non-blocking)."""
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=AUDIO_TEMP_DIR) as tmp:
-                tmp_path = tmp.name
-
-            process = subprocess.run(
-                [
-                    "piper",
-                    "--model", self.voice_model_path,
-                    "--output_file", tmp_path,
-                ],
-                input=text,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-
-            if process.returncode != 0:
-                logger.error(f"Piper CLI error: {process.stderr}")
-                return None
-
-            with open(tmp_path, "rb") as f:
-                audio_bytes = f.read()
-
-            os.unlink(tmp_path)
-            return audio_bytes
-
+            return await asyncio.to_thread(self._synthesize_cli_sync, text)
         except Exception as e:
             logger.error(f"Piper CLI synthesis error: {e}")
             return None

@@ -41,14 +41,40 @@ conversation_response: |
   Respond naturally as a phone assistant. Keep it short (1-3 sentences).
 
 appointment_extraction: |
-  Extract appointment details from the conversation. Return a JSON object with:
-  - customer_name: string or null
-  - customer_phone: string or null
-  - customer_email: string or null
-  - preferred_date: string (YYYY-MM-DD format) or null
-  - preferred_time: string (HH:MM format, 24hr) or null
-  - service_requested: string or null
-  - notes: string or null
+  Analyze the conversation below and determine if an appointment was discussed or requested.
+  Extract ALL appointment-related details mentioned by the caller.
+  
+  IMPORTANT RULES:
+  - If the caller mentioned ANY date, time, or scheduling intent, set appointment_requested to true.
+  - Convert relative dates to absolute YYYY-MM-DD format (e.g., "tomorrow" = the next day, "next Monday" = the actual date).
+  - Today's date is {today_date}.
+  - Convert times to 24-hour HH:MM format (e.g., "2pm" = "14:00", "morning" = "09:00").
+  - If a date was discussed but no specific time, use "09:00" as default.
+  - Extract the caller's name and phone number even if they seem informal.
+  
+  Return ONLY a JSON object in this exact format:
+  {{
+    "appointment_requested": true,
+    "customer_name": "John Smith",
+    "customer_phone": "555-123-4567",
+    "customer_email": null,
+    "preferred_date": "2025-01-15",
+    "preferred_time": "14:00",
+    "service_requested": "General Plumbing",
+    "notes": "Leaky faucet in kitchen"
+  }}
+  
+  If NO appointment was discussed, return:
+  {{
+    "appointment_requested": false,
+    "customer_name": null,
+    "customer_phone": null,
+    "customer_email": null,
+    "preferred_date": null,
+    "preferred_time": null,
+    "service_requested": null,
+    "notes": null
+  }}
   
   CONVERSATION:
   {conversation_history}
